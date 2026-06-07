@@ -1,0 +1,1213 @@
+<?php /* cors.php - proxy protegido para validação e leitura de imagens */
+
+$mode = $_GET['mode'] ?? '';
+$url = $_GET['url'] ?? '';
+$proxy = isset($_GET['proxy']) && $_GET['proxy'] === '1';
+
+if ($mode === 'image_search') {
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+    imageSearch($_GET['q'] ?? '');
+    exit;
+}
+
+if ($mode === 'search_stats') {
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-cache');
+    $days = max(1, min(90, (int)($_GET['days'] ?? 7)));
+    echo json_encode(getSearchStats($days));
+    exit;
+}
+
+if ($url === '') {
+    http_response_code(400);
+    die('URL required');
+}
+
+if (!isSafePublicUrl($url)) {
+    http_response_code(400);
+    error_log('CORS: Unsafe or invalid URL blocked - ' . $url . ' from IP ' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+    die('Invalid URL');
+}
+
+if (isRateLimited($_SERVER['REMOTE_ADDR'] ?? 'unknown')) {
+    http_response_code(429);
+    die('Rate limit exceeded');
+}
+
+if ($proxy) {
+    proxyImage($url);
+    exit;
+}
+
+$headers = getHeaders($url);
+header('Access-Control-Allow-Origin: *');
+
+if (count($headers) === 0) {
+    http_response_code(400);
+    die('Invalid request');
+}
+
+$statusLine = getStatusLine($headers);
+$contentType = getHeaderValue($headers, 'content-type');
+
+if ($statusLine === '' || stripos($contentType, 'image/') !== 0) {
+    http_response_code(400);
+    die('Invalid image');
+}
+
+echo $statusLine;
+
+foreach ($headers as $header) {
+    if (stripos($header, 'Access-Control') !== false) {
+        echo ' ' . $header;
+    }
+}
+
+function proxyImage($url) {
+    $response = fetchImage($url);
+    if (!$response['ok']) {
+        $response = fetchImage($url, true);
+    }
+
+    if (!$response['ok']) {
+        http_response_code(400);
+        die('Invalid image');
+    }
+
+    if ($response['size'] > 8 * 1024 * 1024) {
+        http_response_code(413);
+        die('Image too large');
+    }
+
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Type: ' . $response['contentType']);
+    header('Cache-Control: public, max-age=86400');
+    echo $response['body'];
+}
+
+function fetchImage($url, $browserProfile = false) {
+    $parsed = parse_url($url);
+    $referer = '';
+    if ($parsed && !empty($parsed['scheme']) && !empty($parsed['host'])) {
+        $referer = $parsed['scheme'] . '://' . $parsed['host'] . '/';
+    }
+
+    $headers = [
+        'Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language: pt-BR,pt;q=0.9,en;q=0.7',
+    ];
+    if ($browserProfile) {
+        $headers[] = 'Sec-Fetch-Dest: image';
+        $headers[] = 'Sec-Fetch-Mode: no-cors';
+        $headers[] = 'Sec-Fetch-Site: cross-site';
+    }
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 12);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 4);
+    curl_setopt($ch, CURLOPT_ENCODING, '');
+    curl_setopt($ch, CURLOPT_USERAGENT, $browserProfile ? browserUserAgent() : 'PresslaImageProxy/1.0');
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    if ($referer !== '') {
+        curl_setopt($ch, CURLOPT_REFERER, $referer);
+    }
+
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $contentType = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    curl_close($ch);
+
+    $size = strlen((string) $body);
+    $ok = $body !== false && $status >= 200 && $status < 300 && stripos($contentType, 'image/') === 0 && $size > 0;
+
+    return [
+        'ok' => $ok,
+        'body' => (string) $body,
+        'contentType' => $contentType,
+        'size' => $size,
+    ];
+}
+
+function imageSearch($query) {
+    $query = trim((string) $query);
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+
+    if ($query === '' || strlen($query) > 180) {
+        http_response_code(400);
+        echo json_encode(['items' => []]);
+        return;
+    }
+
+    // 1. PRIMEIRO: busca no banco de imagens local (3230 imagens curadas)
+    $localItems = buscaFigurasLocal($query);
+    if (count($localItems) >= 3) {
+        echo json_encode(['items' => $localItems, 'source' => 'local']);
+        return;
+    }
+
+    // 2. Tenta cache de imagens curadas
+    $cached = buscaFigurasCache($query);
+    if (count($cached) > 0) {
+        // Mescla com imagens locais e retorna os melhores
+        $mixed = array_merge($localItems, $cached);
+        echo json_encode(['items' => array_slice($mixed, 0, 12), 'source' => 'cache']);
+        return;
+    }
+
+    // 3. Busca externa em todas as fontes
+    $items = rankImageItems($query, imageSearchSearxng($query));
+    $allItems = $items;
+
+    // Sempre tenta DuckDuckGo e Bing também, para ter mais candidatos
+    $homeUrl = 'https://duckduckgo.com/?q=' . rawurlencode($query) . '&iax=images&ia=images';
+    $home = fetchText($homeUrl, 'https://duckduckgo.com/');
+    $vqd = extractDuckDuckGoVqd($home);
+
+    if ($vqd !== '') {
+        $apiUrl = 'https://duckduckgo.com/i.js?l=br-pt&o=json&q=' . rawurlencode($query) . '&vqd=' . rawurlencode($vqd) . '&f=,,,&p=1';
+        $json = fetchText($apiUrl, $homeUrl);
+        $data = json_decode($json, true);
+
+        if (is_array($data) && isset($data['results']) && is_array($data['results'])) {
+            foreach ($data['results'] as $result) {
+                $image = $result['image'] ?? '';
+                if (!$image || !isSafePublicUrl($image)) continue;
+                $allItems[] = [
+                    'link' => $image,
+                    'title' => $result['title'] ?? $query,
+                ];
+                if (count($allItems) >= 24) break;
+            }
+        }
+    }
+
+    // Também tenta Bing como fallback
+    $bingItems = imageSearchBing($query);
+    foreach ($bingItems as $bi) {
+        $allItems[] = $bi;
+        if (count($allItems) >= 30) break;
+    }
+
+    // Se ainda tiver poucos candidatos, tenta deep navigation
+    if (count($allItems) < 6) {
+        $deepItems = imageSearchDeepNavigation($query);
+        foreach ($deepItems as $di) {
+            $allItems[] = $di;
+        }
+    }
+
+    // Rankeia TUDO junto e pega os melhores
+    $items = rankImageItems($query, $allItems);
+
+    // Log da busca para estatisticas
+    logSearchQuery($query, count($items), $items);
+
+    echo json_encode(['items' => $items]);
+}
+
+function logSearchQuery($query, $count, $items) {
+    $db = getPresslaDb();
+    if (!$db) return;
+
+    // Coleta dominios dos resultados
+    $dominios = [];
+    foreach ($items as $item) {
+        $h = $item['displayLink'] ?? parse_url($item['link'] ?? '', PHP_URL_HOST) ?? '';
+        if ($h) $dominios[] = $h;
+    }
+
+    try {
+        $stmt = $db->prepare("INSERT INTO log_buscas (termo_busca, qtd_resultados, fonte, origem_ip) VALUES (?, ?, 'cors.php', ?)");
+        $stmt->execute([$query, $count, substr($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1', 0, 45)]);
+    } catch (Exception $e) {}
+}
+
+function getSearchStats($days = 7) {
+    $db = getPresslaDb();
+    if (!$db) return ['error' => 'no_db'];
+
+    try {
+        // Total de buscas no periodo
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM log_buscas WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)");
+        $stmt->execute([$days]);
+        $total = (int)$stmt->fetchColumn();
+
+        // Buscas por dia (ultimos 14 dias)
+        $stmt = $db->prepare("SELECT DATE(created_at) as dia, COUNT(*) as qtd FROM log_buscas WHERE created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) GROUP BY DATE(created_at) ORDER BY dia");
+        $stmt->execute();
+        $porDia = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Top 20 termos mais buscados
+        $stmt = $db->prepare("SELECT termo_busca, COUNT(*) as qtd, AVG(qtd_resultados) as media_resultados FROM log_buscas WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) GROUP BY termo_busca ORDER BY qtd DESC LIMIT 20");
+        $stmt->execute([$days]);
+        $topTermos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Buscas sem resultados
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM log_buscas WHERE qtd_resultados = 0 AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)");
+        $stmt->execute([$days]);
+        $semResultados = (int)$stmt->fetchColumn();
+
+        // Imagens curadas no cache
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM figuras_cache WHERE curado = 1");
+        $stmt->execute();
+        $cacheCuradas = (int)$stmt->fetchColumn();
+
+        // Total de imagens no cache
+        $stmt = $db->prepare("SELECT COUNT(*) as total FROM figuras_cache");
+        $stmt->execute();
+        $cacheTotal = (int)$stmt->fetchColumn();
+
+        return [
+            'periodo_dias' => $days,
+            'total_buscas' => $total,
+            'buscas_sem_resultado' => $semResultados,
+            'taxa_sucesso' => $total > 0 ? round(($total - $semResultados) / $total * 100, 1) : 0,
+            'cache_imagens_curadas' => $cacheCuradas,
+            'cache_total_imagens' => $cacheTotal,
+            'buscas_por_dia' => $porDia,
+            'top_termos' => $topTermos,
+        ];
+    } catch (Exception $e) {
+        return ['error' => $e->getMessage()];
+    }
+}
+
+function imageSearchSearxng($query) {
+    $baseUrl = getenv('PRESSLA_SEARXNG_URL') ?: 'http://127.0.0.1:8888';
+    $url = rtrim($baseUrl, '/') . '/search?q=' . rawurlencode($query) . '&categories=images&format=json&language=pt-BR&safesearch=0&pageno=1';
+    $json = fetchText($url, '', 12, ['Accept: application/json']);
+    $data = json_decode($json, true);
+    $items = [];
+
+    if (!is_array($data) || empty($data['results']) || !is_array($data['results'])) {
+        return $items;
+    }
+
+    foreach ($data['results'] as $result) {
+        $image = $result['img_src'] ?? ($result['thumbnail_src'] ?? ($result['url'] ?? ''));
+        if (!$image || !isSafePublicUrl($image)) {
+            continue;
+        }
+
+        $items[] = [
+            'link' => $image,
+            'title' => $result['title'] ?? $query,
+            'displayLink' => parse_url($result['url'] ?? $image, PHP_URL_HOST) ?: '',
+            'snippet' => $result['content'] ?? '',
+        ];
+
+        if (count($items) >= 12) {
+            break;
+        }
+    }
+
+    return $items;
+}
+
+function rankImageItems($query, $items) {
+    $tokens = searchTokens($query);
+    $nameTokens = array_values(array_filter($tokens, function($token) {
+        return !preg_match('/^\d/', $token);
+    }));
+    $measureTokens = measureTokens($query);
+    $ranked = [];
+
+    foreach ($items as $item) {
+        if (isBadCartazImageItem($item)) {
+            continue;
+        }
+
+        $text = normalizeSearchText(
+            ($item['title'] ?? '') . ' ' .
+            ($item['snippet'] ?? '') . ' ' .
+            ($item['displayLink'] ?? '') . ' ' .
+            ($item['link'] ?? '')
+        );
+        $compact = preg_replace('/[^A-Z0-9]/', '', $text);
+        $host = strtolower(parse_url($item['link'], PHP_URL_HOST) ?: '');
+        $score = 0;
+
+        if (empty($item['link']) || !filter_var($item['link'], FILTER_VALIDATE_URL)) {
+            continue;
+        }
+
+        $matchedName = 0;
+        foreach ($nameTokens as $token) {
+            if (strpos($text, $token) !== false || strpos($compact, $token) !== false) {
+                $matchedName++;
+                $score += in_array($token, ['CAFE', 'CAFÉ'], true) ? 18 : 14;
+            }
+        }
+
+        $minimumName = count($nameTokens) >= 4 ? 3 : (count($nameTokens) >= 2 ? 2 : count($nameTokens));
+        if ($minimumName > 0 && $matchedName < $minimumName) {
+            $score -= ($minimumName - $matchedName) * 35;
+        }
+
+        foreach ($measureTokens as $measure) {
+            $measureCompact = preg_replace('/\s+/', '', $measure);
+            if (strpos($text, $measure) !== false || strpos($compact, $measureCompact) !== false) {
+                $score += 30;
+            } else {
+                $score -= 35;
+            }
+        }
+
+        $queryText = normalizeSearchText($query);
+        if ($queryText !== '' && strpos($text, $queryText) !== false) {
+            $score += 80;
+        }
+
+        // ─── BÔNUS: domínios conhecidos com foto de produto de supermercado ───
+        $supermercadoHosts = [
+            'sondadelivery.com.br', 'obahortifruti.com.br', 'paodeacucar.com',
+            'mambodelivery.com.br', 'magazineluiza.com.br',
+            'mercadovanessa.com.br', 'carrefour.com.br', 'carrefour.com',
+            'coopsp', 'dellys.com.br', 'bompreco', 'tendaatacado.com.br',
+            'atacadao.com.br', 'assai.com.br', 'grupoassai.com.br',
+            'vtexassets.com', 'vteximg.com.br', 'vtexlocal.com',
+            'tcdn.com.br', 'mlcdn.com.br',
+            'static.paodeacucar.com', 'static.carrefour.com',
+            'swift.com.br', 'friboi.com.br', 'seara.com.br', 'sadia.com.br',
+            'tirol.com.br', 'italac.com.br', 'piracanjuba.com.br',
+            'camil.com.br', 'kicaldo.com.br', 'neston.com.br',
+            'nestle.com.br', 'ambev.com.br', 'cocacola.com.br',
+            'pachá.com.br', 'danone.com.br', 'vigor.com.br',
+            'batavo.com.br', 'pullman.com.br', 'wickbold.com.br',
+            'sevenboys.com.br', 'dori.com.br', 'heinz.com.br',
+            'parati.com.br', 'predilecta.com.br', 'hemmer.com.br',
+            'ceratti.com.br', 'sadia.com', 'perdigao.com.br',
+            'qualy.com.br', 'beckers.com.br', 'skinka.com.br',
+            'laticinios.com.br', 'laticínio', 'granformaggi.com.br',
+            // CDNs e plataformas de produto
+            'arquivos', 'images.tcdn.com.br', 'cdn.magazineluiza.com.br',
+            'a-static.com.br', 'static.zoomal.com.br',
+            'superprix.com.br', 'supermercado', 'mercadao',
+            'emporio', 'mercafacil', 'super', 'hiper',
+        ];
+        foreach ($supermercadoHosts as $s) {
+            if (strpos($host, $s) !== false || strpos($item['link'], $s) !== false) {
+                $score += 45;
+                break;
+            }
+        }
+
+        // ─── BÔNUS: padrões de URL de imagem de produto ───
+        $produtoPatterns = [
+            '/\/(sku|produto|product|prod|item)\//i',
+            '/[?&]sku=/i', '/[?&]ean=/i',
+            '/\d{8,13}\./',  // código EAN na URL
+            '/\d+x\d+\.(jpg|png|webp)/i',  // dimensões padrão
+        ];
+        foreach ($produtoPatterns as $p) {
+            if (preg_match($p, $item['link'])) {
+                $score += 25;
+                break;
+            }
+        }
+
+        // ─── PENALIDADE: domínios genéricos (blog, article, news) mesmo não bloqueados ───
+        $genericDomains = [
+            'wordpress', 'blog', 'article', 'news', 'magazine',
+            'review', 'tutorial', 'guide', 'list', 'top10',
+            'receita', 'recipes', '.receita', '.receitas',
+        ];
+        foreach ($genericDomains as $g) {
+            if (strpos($host, $g) !== false) {
+                $score -= 50;
+                break;
+            }
+        }
+
+        if (preg_match('/\b(PRODUTO|EMBALAGEM|SUPERMERCADO|MERCADO|ATACADO|VAREJO|PACOTE|VACUO|TORRADO|MOIDO)\b/', $text)) {
+            $score += 15;
+        }
+
+        if (preg_match('/\b(ABACATE|RECEITA|RECEITAS|CARDAPIO|RESTAURANTE|TURISMO|MAPA|VIAGEM|BLOG|COOKIES)\b/', $text)) {
+            $score -= 110;
+        }
+
+        if (preg_match('/\b(PINTEREST|UNSPLASH|FLICKR|ELO7)\b/', $text)) {
+            $score -= 55;
+        }
+
+        if (preg_match('/\b(JSDELIVR|DEVICON|LUCIDE|STATIC\/ICONS|ICON\.SVG)\b/', $text) || preg_match('/\.svg(\?|$)/i', $item['link'])) {
+            $score -= 120;
+        }
+
+        $item['_score'] = $score;
+        $ranked[] = $item;
+    }
+
+    usort($ranked, function($a, $b) {
+        return ($b['_score'] ?? 0) <=> ($a['_score'] ?? 0);
+    });
+
+    $ranked = array_values(array_filter($ranked, function($item) {
+        return ($item['_score'] ?? 0) > -140;
+    }));
+
+    return array_slice(array_map(function($item) {
+        unset($item['_score']);
+        return $item;
+    }, $ranked), 0, 12);
+}
+
+// ─── Cache de imagens curadas ────────────────────────────────────────────
+function buscaFigurasCache($query) {
+    $normalized = normalizeSearchText($query);
+    $tokens = searchTokens($normalized);
+    if (count($tokens) === 0) return [];
+    $db = getPresslaDb();
+    if (!$db) return [];
+    $like = []; $params = [];
+    foreach ($tokens as $t) { $like[] = "termo_busca LIKE ?"; $params[] = '%' . $t . '%'; }
+    try {
+        $stmt = $db->prepare("SELECT url_imagem, titulo, dominio FROM figuras_cache WHERE curado = 1 AND (" . implode(' AND ', $like) . ") ORDER BY score DESC LIMIT 12");
+        $stmt->execute($params);
+        $items = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $items[] = ['link' => $row['url_imagem'], 'title' => $row['titulo'], 'displayLink' => $row['dominio'], 'snippet' => 'Imagem curada'];
+        }
+        return $items;
+    } catch (Exception $e) { return []; }
+}
+
+// ─── Busca no banco de imagens local (figuras) ──────────────────────────
+function buscaFigurasLocal($query) {
+    $db = getPresslaDb();
+    if (!$db) return [];
+
+    $normalized = normalizeSearchText($query);
+    $tokens = searchTokens($normalized);
+    if (count($tokens) === 0) return [];
+
+    // Constrói busca AND (todos os tokens precisam bater)
+    $like = []; $params = [];
+    foreach ($tokens as $t) {
+        $like[] = "(nome LIKE ? OR ean LIKE ?)";
+        $params[] = '%' . $t . '%';
+        $params[] = '%' . $t . '%';
+    }
+    $where = implode(' AND ', $like);
+
+    try {
+        $stmt = $db->prepare("SELECT nome, src FROM figuras WHERE $where ORDER BY nome LIMIT 15");
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $items = [];
+        $baseUrl = 'https://app.pressla.com.br/assets/images/figuras/';
+        foreach ($rows as $row) {
+            if (empty($row['src'])) continue;
+            $items[] = [
+                'link' => $baseUrl . $row['src'],
+                'title' => $row['nome'],
+                'displayLink' => 'pressla.com.br',
+                'snippet' => 'Imagem local',
+            ];
+        }
+        return $items;
+    } catch (Exception $e) { return []; }
+}
+function salvaFigurasCache($query, $items) {
+    $db = getPresslaDb();
+    if (!$db) return;
+    try {
+        $stmt = $db->prepare("INSERT IGNORE INTO figuras_cache (termo_busca, url_imagem, titulo, dominio, score) VALUES (?, ?, ?, ?, ?)");
+        foreach ($items as $item) {
+            if (empty($item['link'])) continue;
+            $stmt->execute([$query, $item['link'], substr($item['title'] ?? $query, 0, 300), $item['displayLink'] ?? parse_url($item['link'], PHP_URL_HOST) ?? '', $item['_score'] ?? 0]);
+        }
+    } catch (Exception $e) {}
+}
+function getPresslaDb() {
+    static $pdo = null;
+    if ($pdo !== null) return $pdo;
+    try {
+        $host = getenv('DB_HOST') ?: '127.0.0.1';
+        $pdo = new PDO("mysql:host=$host;port=" . (getenv('DB_PORT') ?: '3306') . ";dbname=" . (getenv('DB_NAME') ?: 'pressla') . ";charset=utf8mb4", getenv('DB_USER') ?: 'pressla_user', getenv('DB_PASS') ?: 'Pressla321admin', [PDO::ATTR_TIMEOUT => 3, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        return $pdo;
+    } catch (Exception $e) { return null; }
+}
+
+function isBadCartazImageItem($item) {
+    $link = (string) ($item['link'] ?? '');
+    $display = strtolower((string) ($item['displayLink'] ?? ''));
+    $host = strtolower(parse_url($link, PHP_URL_HOST) ?: '');
+    $text = normalizeSearchText(
+        ($item['title'] ?? '') . ' ' .
+        ($item['snippet'] ?? '') . ' ' .
+        ($item['displayLink'] ?? '') . ' ' .
+        $link
+    );
+
+    $blockedHosts = [
+        'pinterest.', 'unsplash.', 'flickr.', 'facebook.', 'instagram.',
+        'artic.edu', 'wikimedia.', 'wikipedia.', 'tudoreceitas.',
+        'receitas123.', 'vitat.', 'tvchurrasco.', 'blogspot.',
+        'wordpress.', 'panelinha.', 'cybercook.', 'shutterstock.',
+        'depositphotos.', 'istockphoto.', 'freepik.', 'pngtree.',
+        'lucioushentai.', 'rule34.', 'bing.com',
+        // Sites de blog, noticias, estatisticas - NAO tem foto de produto
+        'demandsage.com', 'statista.com', 'fineartamerica.com',
+        'redbubble.com', 'teepublic.com', 'society6.com',
+        'deviantart.com', 'behance.net', 'dribbble.com', '500px.com',
+        'pexels.com', 'pixabay.com', 'stock.adobe.com',
+        '123rf.com', 'dreamstime.com', 'canva.com', 'vecteezy.com',
+        'thenounproject.com', 'vectorstock.com', 'clipartmax.com',
+        'clipartkey.com', 'cleanpng.com', 'pngitem.com', 'pngfind.com',
+        'nicepng.com', 'pngmart.com', 'kindpng.com', 'pluspng.com',
+        'toppng.com', 'vippng.com', 'pngegg.com', 'pngaaa.com',
+        'babytaste.net', 'dlf.pt', 'gstatic.com', 'ytimg.com',
+        'googleusercontent.com', 'fbcdn.net', 'twimg.com',
+        'media.tumblr.com', 'tiktokcdn.com', 'pinimg.com',
+        'blogger.com', 'blog.google', 'medium.com', 'substack.com',
+        'reddit.com', 'redd.it', 'quora.com', 'yelp.com',
+        'tripadvisor.com', 'booking.com', 'airbnb.com',
+        'imdb.com', 'rottentomatoes.com', 'ign.com', 'gamespot.com',
+        'cnn.com', 'bbc.com', 'bbc.co.uk', 'globo.com', 'uol.com.br',
+        'terra.com.br', 'r7.com', 'ig.com.br', 'yahoo.com',
+        'msn.com', 'noticias', 'g1.globo', 'extra.globo',
+        'veja.abril', 'exame.com', 'infomoney.com', 'valor.globo',
+        'seucreditodigital.com', 'convertunits.com', 'receitadev.com.br',
+    ];
+
+    foreach ($blockedHosts as $blocked) {
+        if (strpos($host, $blocked) !== false || strpos($display, $blocked) !== false || strpos(strtolower($link), $blocked) !== false) {
+            return true;
+        }
+    }
+
+    // Apenas bloqueia imagens claramente inadequadas para cartaz de supermercado
+    // NÃO bloquear nomes de produtos reais como ARROZ, LIMAO, SICILIANO, MOLHO etc.
+    if (preg_match('/\b(RECEITA|COMO FAZER|PRATO|GRELHADO|ASSADO|COZIDO|REFOGADO|CHURRASCO|RESTAURANTE|CARDAPIO|BLOG|WALLPAPER|CLIPART|VECTOR|ICON|ICONE|HENTAI|PORN|XXX|NUDE)\b/', $text)) {
+        return true;
+    }
+
+    if (preg_match('/\.(svg)(\?|$)/i', $link)) {
+        return true;
+    }
+
+    return false;
+}
+
+function searchTokens($text) {
+    $ignored = ['COM' => true, 'SEM' => true, 'PARA' => true, 'DAS' => true, 'DOS' => true, 'TIPO' => true, 'SABOR' => true, 'SABORES' => true, 'UN' => true, 'UND' => true];
+    $parts = preg_split('/[^A-Z0-9]+/', normalizeSearchText($text));
+    $tokens = [];
+
+    foreach ($parts as $part) {
+        if (strlen($part) < 3 || isset($ignored[$part])) {
+            continue;
+        }
+        $tokens[] = $part;
+    }
+
+    return array_values(array_unique($tokens));
+}
+
+function measureTokens($text) {
+    preg_match_all('/\d+\s*(G|GR|KG|ML|L|UN|UND)\b/', normalizeSearchText($text), $matches);
+    return $matches[0] ?? [];
+}
+
+function normalizeSearchText($text) {
+    $text = html_entity_decode((string) $text, ENT_QUOTES, 'UTF-8');
+    $converted = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $text);
+    if ($converted !== false) {
+        $text = $converted;
+    }
+    return strtoupper($text);
+}
+
+function imageSearchBing($query) {
+    $url = 'https://www.bing.com/images/search?q=' . rawurlencode($query) . '&form=HDRSC2&first=1';
+    $html = fetchText($url, 'https://www.bing.com/');
+    $items = [];
+
+    if ($html === '') {
+        return $items;
+    }
+
+    if (preg_match_all('/m="([^"]+)"/', $html, $matches)) {
+        foreach ($matches[1] as $raw) {
+            $json = html_entity_decode($raw, ENT_QUOTES, 'UTF-8');
+            $data = json_decode($json, true);
+            $image = $data['murl'] ?? '';
+
+            if (!$image || !isSafePublicUrl($image)) {
+                continue;
+            }
+
+            $items[] = [
+                'link' => $image,
+                'title' => $data['t'] ?? $query,
+                'displayLink' => parse_url($image, PHP_URL_HOST) ?: '',
+            ];
+
+            if (count($items) >= 12) {
+                break;
+            }
+        }
+    }
+
+    if (count($items) === 0 && preg_match_all('/&quot;murl&quot;:&quot;(.*?)&quot;.*?&quot;t&quot;:&quot;(.*?)&quot;/s', $html, $matches, PREG_SET_ORDER)) {
+        foreach ($matches as $match) {
+            $image = stripcslashes(html_entity_decode($match[1], ENT_QUOTES, 'UTF-8'));
+
+            if (!$image || !isSafePublicUrl($image)) {
+                continue;
+            }
+
+            $items[] = [
+                'link' => $image,
+                'title' => stripcslashes(html_entity_decode($match[2], ENT_QUOTES, 'UTF-8')),
+                'displayLink' => parse_url($image, PHP_URL_HOST) ?: '',
+            ];
+
+            if (count($items) >= 12) {
+                break;
+            }
+        }
+    }
+
+    return $items;
+}
+
+function imageSearchDeepNavigation($query) {
+    $items = [];
+    $seenImages = [];
+    $seenPages = [];
+    $variants = searchQueryVariants($query);
+
+    foreach ($variants as $variant) {
+        foreach (searchResultPages($variant) as $pageUrl) {
+            if (isset($seenPages[$pageUrl]) || !isSafePublicUrl($pageUrl)) {
+                continue;
+            }
+            $seenPages[$pageUrl] = true;
+
+            $html = fetchText($pageUrl, '', 8);
+            if ($html === '') {
+                continue;
+            }
+
+            foreach (extractImagesFromPage($html, $pageUrl, $query) as $item) {
+                $image = $item['link'] ?? '';
+                if (!$image || isset($seenImages[$image]) || !isSafePublicUrl($image)) {
+                    continue;
+                }
+
+                $seenImages[$image] = true;
+                $items[] = $item;
+
+                if (count($items) >= 18) {
+                    return $items;
+                }
+            }
+        }
+    }
+
+    return $items;
+}
+
+function searchQueryVariants($query) {
+    $base = trim((string) $query);
+    $tokens = tokensForQueryVariant($base);
+    $short = implode(' ', array_slice($tokens, 0, 5));
+    $variants = [
+        $base,
+        trim($base . ' produto embalagem'),
+        trim($base . ' supermercado'),
+    ];
+
+    if ($short !== '' && $short !== $base) {
+        $variants[] = $short;
+        $variants[] = trim($short . ' produto');
+    }
+
+    return array_values(array_unique(array_filter($variants)));
+}
+
+function tokensForQueryVariant($query) {
+    $ignored = ['COM' => true, 'SEM' => true, 'PARA' => true, 'DAS' => true, 'DOS' => true, 'TIPO' => true, 'SABOR' => true, 'SABORES' => true, 'UN' => true, 'UND' => true];
+    $parts = preg_split('/[^A-Z0-9]+/', normalizeSearchText($query));
+    $tokens = [];
+
+    foreach ($parts as $part) {
+        if (strlen($part) < 3 || isset($ignored[$part])) {
+            continue;
+        }
+        $tokens[] = $part;
+    }
+
+    return array_values(array_unique($tokens));
+}
+
+function searchResultPages($query) {
+    $pages = [];
+    $engines = [
+        ['url' => 'https://www.bing.com/search?q=' . rawurlencode($query), 'referer' => 'https://www.bing.com/'],
+        ['url' => 'https://duckduckgo.com/html/?q=' . rawurlencode($query), 'referer' => 'https://duckduckgo.com/'],
+    ];
+
+    foreach ($engines as $engine) {
+        $html = fetchText($engine['url'], $engine['referer'], 8);
+        if ($html === '') {
+            continue;
+        }
+
+        foreach (extractSearchLinks($html) as $url) {
+            if (isSearchInternalUrl($url) || isset($pages[$url])) {
+                continue;
+            }
+            $pages[$url] = true;
+            if (count($pages) >= 10) {
+                break 2;
+            }
+        }
+    }
+
+    return array_keys($pages);
+}
+
+function extractSearchLinks($html) {
+    $links = [];
+
+    if (preg_match_all('/<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $html, $matches)) {
+        foreach ($matches[1] as $href) {
+            $href = html_entity_decode($href, ENT_QUOTES, 'UTF-8');
+            $url = unwrapSearchUrl($href);
+            if ($url && filter_var($url, FILTER_VALIDATE_URL)) {
+                $links[] = $url;
+            }
+        }
+    }
+
+    return array_values(array_unique($links));
+}
+
+function unwrapSearchUrl($href) {
+    if (strpos($href, '//duckduckgo.com/l/?') === 0) {
+        $href = 'https:' . $href;
+    }
+
+    if (strpos($href, '/l/?') === 0) {
+        $href = 'https://duckduckgo.com' . $href;
+    }
+
+    $parts = parse_url($href);
+    if (!$parts) {
+        return '';
+    }
+
+    if (!empty($parts['host']) && preg_match('/(^|\.)duckduckgo\.com$/i', $parts['host']) && !empty($parts['query'])) {
+        parse_str($parts['query'], $params);
+        if (!empty($params['uddg']) && filter_var($params['uddg'], FILTER_VALIDATE_URL)) {
+            return $params['uddg'];
+        }
+    }
+
+    if (strpos($href, 'http://') === 0 || strpos($href, 'https://') === 0) {
+        return $href;
+    }
+
+    return '';
+}
+
+function isSearchInternalUrl($url) {
+    $host = strtolower(parse_url($url, PHP_URL_HOST) ?: '');
+    return $host === '' || preg_match('/(^|\.)?(bing|duckduckgo|microsoft|msn)\.com$/', $host);
+}
+
+function extractImagesFromPage($html, $pageUrl, $query) {
+    $items = [];
+    $pageTitle = extractPageTitle($html);
+    $baseText = $pageTitle . ' ' . $pageUrl;
+
+    foreach (extractMetaImages($html) as $image) {
+        $absolute = absoluteUrl($image, $pageUrl);
+        if ($absolute) {
+            $items[] = [
+                'link' => $absolute,
+                'title' => $pageTitle ?: $query,
+                'displayLink' => parse_url($pageUrl, PHP_URL_HOST) ?: '',
+                'snippet' => $baseText,
+            ];
+        }
+    }
+
+    foreach (extractJsonLdImages($html) as $image) {
+        $absolute = absoluteUrl($image, $pageUrl);
+        if ($absolute) {
+            $items[] = [
+                'link' => $absolute,
+                'title' => $pageTitle ?: $query,
+                'displayLink' => parse_url($pageUrl, PHP_URL_HOST) ?: '',
+                'snippet' => $baseText,
+            ];
+        }
+    }
+
+    if (preg_match_all('/<img\b[^>]*>/i', $html, $matches)) {
+        foreach ($matches[0] as $tag) {
+            $src = extractAttribute($tag, 'src');
+            if ($src === '') {
+                $src = extractAttribute($tag, 'data-src');
+            }
+            if ($src === '') {
+                $srcset = extractAttribute($tag, 'srcset');
+                $src = firstSrcsetUrl($srcset);
+            }
+
+            $absolute = absoluteUrl($src, $pageUrl);
+            if (!$absolute || !looksLikeImageUrl($absolute)) {
+                continue;
+            }
+
+            $alt = extractAttribute($tag, 'alt');
+            $title = extractAttribute($tag, 'title');
+            $text = $baseText . ' ' . $alt . ' ' . $title . ' ' . $absolute;
+            if (!hasEnoughImageContext($query, $text)) {
+                continue;
+            }
+
+            $items[] = [
+                'link' => $absolute,
+                'title' => $title ?: ($alt ?: ($pageTitle ?: $query)),
+                'displayLink' => parse_url($pageUrl, PHP_URL_HOST) ?: '',
+                'snippet' => $text,
+            ];
+        }
+    }
+
+    return dedupeImageItems($items);
+}
+
+function extractMetaImages($html) {
+    $images = [];
+    if (preg_match_all('/<meta\b[^>]*(?:property|name)=["\'](?:og:image|og:image:url|twitter:image|twitter:image:src)["\'][^>]*>/i', $html, $matches)) {
+        foreach ($matches[0] as $tag) {
+            $content = extractAttribute($tag, 'content');
+            if ($content !== '') {
+                $images[] = $content;
+            }
+        }
+    }
+    return $images;
+}
+
+function extractJsonLdImages($html) {
+    $images = [];
+    if (!preg_match_all('/<script\b[^>]*type=["\']application\/ld\+json["\'][^>]*>(.*?)<\/script>/is', $html, $matches)) {
+        return $images;
+    }
+
+    foreach ($matches[1] as $rawJson) {
+        $data = json_decode(html_entity_decode(trim($rawJson), ENT_QUOTES, 'UTF-8'), true);
+        collectJsonImages($data, $images);
+    }
+
+    return $images;
+}
+
+function collectJsonImages($value, &$images) {
+    if (is_string($value)) {
+        if (filter_var($value, FILTER_VALIDATE_URL) && looksLikeImageUrl($value)) {
+            $images[] = $value;
+        }
+        return;
+    }
+
+    if (!is_array($value)) {
+        return;
+    }
+
+    foreach ($value as $key => $child) {
+        if (strtolower((string) $key) === 'image') {
+            collectJsonImages($child, $images);
+        } elseif (is_array($child)) {
+            collectJsonImages($child, $images);
+        }
+    }
+}
+
+function extractPageTitle($html) {
+    if (preg_match('/<title[^>]*>(.*?)<\/title>/is', $html, $match)) {
+        return trim(html_entity_decode(strip_tags($match[1]), ENT_QUOTES, 'UTF-8'));
+    }
+    return '';
+}
+
+function extractAttribute($tag, $attribute) {
+    if (preg_match('/\b' . preg_quote($attribute, '/') . '\s*=\s*(["\'])(.*?)\1/i', $tag, $match)) {
+        return html_entity_decode($match[2], ENT_QUOTES, 'UTF-8');
+    }
+    return '';
+}
+
+function firstSrcsetUrl($srcset) {
+    $parts = explode(',', (string) $srcset);
+    if (count($parts) === 0) {
+        return '';
+    }
+    return trim(preg_split('/\s+/', trim($parts[0]))[0] ?? '');
+}
+
+function absoluteUrl($url, $baseUrl) {
+    $url = trim((string) $url);
+    if ($url === '' || stripos($url, 'data:') === 0) {
+        return '';
+    }
+    if (strpos($url, '//') === 0) {
+        return 'https:' . $url;
+    }
+    if (preg_match('/^https?:\/\//i', $url)) {
+        return $url;
+    }
+
+    $base = parse_url($baseUrl);
+    if (!$base || empty($base['scheme']) || empty($base['host'])) {
+        return '';
+    }
+
+    $root = $base['scheme'] . '://' . $base['host'];
+    if (!empty($base['port'])) {
+        $root .= ':' . $base['port'];
+    }
+
+    if (strpos($url, '/') === 0) {
+        return $root . $url;
+    }
+
+    $path = $base['path'] ?? '/';
+    $dir = preg_replace('#/[^/]*$#', '/', $path);
+    return $root . $dir . $url;
+}
+
+function looksLikeImageUrl($url) {
+    $path = strtolower(parse_url($url, PHP_URL_PATH) ?: '');
+    if (preg_match('/\.(jpe?g|png|webp|gif|avif)(\?.*)?$/i', $url)) {
+        return true;
+    }
+    return strpos($path, '/image') !== false || strpos($path, '/img') !== false || strpos($path, '/photo') !== false;
+}
+
+function hasEnoughImageContext($query, $text) {
+    $tokens = tokensForQueryVariant($query);
+    if (count($tokens) === 0) {
+        return true;
+    }
+
+    $normalized = normalizeSearchText($text);
+    $compact = preg_replace('/[^A-Z0-9]/', '', $normalized);
+    $hits = 0;
+
+    foreach ($tokens as $token) {
+        if (strpos($normalized, $token) !== false || strpos($compact, $token) !== false) {
+            $hits++;
+        }
+    }
+
+    $minimum = count($tokens) >= 4 ? 2 : 1;
+    return $hits >= $minimum;
+}
+
+function dedupeImageItems($items) {
+    $seen = [];
+    $deduped = [];
+    foreach ($items as $item) {
+        $link = $item['link'] ?? '';
+        if ($link === '' || isset($seen[$link])) {
+            continue;
+        }
+        $seen[$link] = true;
+        $deduped[] = $item;
+    }
+    return $deduped;
+}
+
+function fetchText($url, $referer = '', $timeout = 12, $headers = []) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+    curl_setopt($ch, CURLOPT_ENCODING, '');
+    curl_setopt($ch, CURLOPT_USERAGENT, browserUserAgent());
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers ?: [
+        'Accept: text/html,application/json;q=0.9,*/*;q=0.8',
+        'Accept-Language: pt-BR,pt;q=0.9,en;q=0.7',
+    ]);
+    if ($referer !== '') {
+        curl_setopt($ch, CURLOPT_REFERER, $referer);
+    }
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($body === false || $status < 200 || $status >= 300) {
+        return '';
+    }
+
+    return (string) $body;
+}
+
+function browserUserAgent() {
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+}
+
+function extractDuckDuckGoVqd($html) {
+    if (!is_string($html) || $html === '') {
+        return '';
+    }
+
+    $patterns = [
+        "/vqd='([^']+)'/",
+        '/vqd="([^"]+)"/',
+        '/vqd=([0-9-]+)&/',
+        '/"vqd":"([^"]+)"/',
+    ];
+
+    foreach ($patterns as $pattern) {
+        if (preg_match($pattern, $html, $matches)) {
+            return html_entity_decode($matches[1], ENT_QUOTES, 'UTF-8');
+        }
+    }
+
+    return '';
+}
+
+function getHeaders($url) {
+    $headers = array();
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+    curl_setopt($ch, CURLOPT_NOBODY, true);
+    curl_setopt($ch, CURLOPT_HEADER, true);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'PresslaImageProxy/1.0');
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8']);
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header) use (&$headers) {
+        $headers[] = $header;
+        return strlen($header);
+    });
+    curl_exec($ch);
+    curl_close($ch);
+    return $headers;
+}
+
+function getStatusLine($headers) {
+    foreach ($headers as $header) {
+        if (stripos($header, 'HTTP/') === 0) {
+            return $header;
+        }
+    }
+    return '';
+}
+
+function getHeaderValue($headers, $name) {
+    $needle = strtolower($name) . ':';
+    $value = '';
+    foreach ($headers as $header) {
+        if (stripos($header, $needle) === 0) {
+            $value = trim(substr($header, strlen($needle)));
+        }
+    }
+    return $value;
+}
+
+function isSafePublicUrl($url) {
+    if (!filter_var($url, FILTER_VALIDATE_URL)) {
+        return false;
+    }
+
+    $parsed = parse_url($url);
+    if (!$parsed || empty($parsed['scheme']) || empty($parsed['host'])) {
+        return false;
+    }
+
+    if (!in_array(strtolower($parsed['scheme']), ['http', 'https'], true)) {
+        return false;
+    }
+
+    if (!empty($parsed['port']) && !in_array((int) $parsed['port'], [80, 443], true)) {
+        return false;
+    }
+
+    $host = strtolower($parsed['host']);
+    if ($host === 'localhost' || substr($host, -6) === '.local') {
+        return false;
+    }
+
+    $records = @dns_get_record($host, DNS_A + DNS_AAAA);
+    if (!$records) {
+        $ips = @gethostbynamel($host);
+        if (is_array($ips)) {
+            $records = array_map(function($ip) {
+                return ['ip' => $ip];
+            }, $ips);
+        }
+    }
+    if (!$records) {
+        return false;
+    }
+
+    foreach ($records as $record) {
+        $ip = $record['ip'] ?? ($record['ipv6'] ?? null);
+        if (!$ip || !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function isRateLimited($clientId) {
+    $window = 300;
+    $limit = 200;
+    $now = time();
+    $safeId = preg_replace('/[^a-zA-Z0-9_.-]/', '_', $clientId);
+    $file = sys_get_temp_dir() . '/pressla_cors_rate_' . md5($safeId) . '.json';
+    $state = ['start' => $now, 'count' => 0];
+
+    $handle = fopen($file, 'c+');
+    if (!$handle) {
+        return false;
+    }
+
+    flock($handle, LOCK_EX);
+    $contents = stream_get_contents($handle);
+    if ($contents) {
+        $decoded = json_decode($contents, true);
+        if (is_array($decoded) && isset($decoded['start'], $decoded['count'])) {
+            $state = $decoded;
+        }
+    }
+
+    if (($now - (int) $state['start']) > $window) {
+        $state = ['start' => $now, 'count' => 0];
+    }
+
+    $state['count'] = (int) $state['count'] + 1;
+    ftruncate($handle, 0);
+    rewind($handle);
+    fwrite($handle, json_encode($state));
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+
+    return $state['count'] > $limit;
+}
